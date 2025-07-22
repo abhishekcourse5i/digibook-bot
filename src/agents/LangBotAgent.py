@@ -1,0 +1,249 @@
+from langgraph.prebuilt import create_react_agent
+from langchain_core.messages import HumanMessage
+from src.llm.base_llm import get_llm
+from src.tools.sqlite_tool import sqlite_tool
+from src.tools.read_file_content import read_file_content
+from langgraph_supervisor.supervisor import create_supervisor
+from pydantic import BaseModel, Field
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.store.memory import InMemoryStore
+from langchain_core.messages import convert_to_messages
+from langchain_core.runnables.config import RunnableConfig
+from typing import Optional
+
+checkpointer = InMemorySaver()
+store = InMemoryStore()
+
+def pretty_print_message(message, indent=False):
+    pretty_message = message.pretty_repr(html=True)
+    if not indent:
+        print(pretty_message)
+        return
+
+    indented = "\n".join("\t" + c for c in pretty_message.split("\n"))
+    print(indented)
+
+
+def pretty_print_messages(update, last_message=False):
+    is_subgraph = False
+    if isinstance(update, tuple):
+        ns, update = update
+        # skip parent graph updates in the printouts
+        if len(ns) == 0:
+            return
+
+        graph_id = ns[-1].split(":")[0]
+        print(f"Update from subgraph {graph_id}:")
+        print("\n")
+        is_subgraph = True
+
+    for node_name, node_update in update.items():
+        update_label = f"Update from node {node_name}:"
+        if is_subgraph:
+            update_label = "\t" + update_label
+
+        print(update_label)
+        print("\n")
+
+        messages = convert_to_messages(node_update["messages"])
+        if last_message:
+            messages = messages[-1:]
+
+        for m in messages:
+            pretty_print_message(m, indent=is_subgraph)
+        print("\n")
+
+class Response(BaseModel):
+    answer: str = Field(description="The main answer to the user's question. For chit-chat or clarifications, this is the only field that should be filled.")
+    sql_query: Optional[str] = Field(default=None, description="The SQL query generated, if applicable.")
+    reframed_query: Optional[str] = Field(default=None, description="The reframed technical query, if applicable.")
+    ba_analysis: Optional[str] = Field(default=None, description="Business analysis output, if applicable.")
+    suggested_questions: Optional[list[str]] = Field(default=None, description="Suggested similar questions, if applicable.")
+    is_chitchat: bool = Field(default=False, description="True if the question is chit-chat or non-database.")
+    is_clarification_needed: bool = Field(default=False, description="True if a clarifying question is needed; in this case, only 'answer' should be filled.")
+
+class LangBotAgent:
+    def __init__(self):
+        self.model = get_llm("gpt-4o-mini")
+        self.supervisor_model = get_llm("gpt-4o")
+        
+        # --- Database pipeline agents ---
+
+        self.clarity_check_agent = create_react_agent(
+            model=self.model,
+            tools=[read_file_content],
+            name="clarity_check_agent",
+            prompt=(
+                "You are a Clarity Check Agent for a Text2SQL system based on the DigiBook database.\n\n"
+                "Your job is to determine if a user’s question is:\n"
+                "1. **Clear** — includes all necessary filters (e.g., time, metric, quantity, dimension) and maps to the schema.\n"
+                "2. **Ambiguous** — vague, incomplete, or missing key details.\n"
+                "3. **Schema-Mismatched** — uses terms that don’t appear in the database schema.\n\n"
+                "You have access to the `read_file_content` tool to check the schema. Use it when you're unsure whether a column or table exists.\n\n"
+                "### You must check:\n"
+                "- If vague metric terms like `top`, `best`, `performance`, `recent`, `total` are used without context\n"
+                "- If vague dimensions like `employee`, `sales`, `data`, `project` appear without grounding in the schema\n"
+                "- If required qualifiers like quantity (e.g., 'top 5'), metric (e.g., `Total__c`), or time (e.g., `Year__c`) are missing\n"
+                "- If the term maps to multiple possible schema paths (e.g., 'sales lead' vs. 'account owner')\n"
+                "- If terms don’t exist in the schema (e.g., 'unicorn', 'likes', 'followers')\n\n"
+                "### Respond as follows:\n"
+                "- If the question is fully clear and schema-valid: respond with `clear`\n"
+                "- If ambiguous: output a clarifying question to ask the user\n"
+                "- If schema-mismatched: suggest a correction or rephrasing\n\n"
+                "### DigiBook-Specific Examples:\n"
+                "Q: What is the Total__c for 2023 by account? → clear\n"
+                "Q: Show the PO_Total__c by Vertical for FY2024 → clear\n"
+                "Q: Who created the most OBM entries in the last month? → Please clarify if 'last month' refers to a specific date or Month__c and Year__c combination.\n"
+                "Q: List top clients → What metric defines 'top clients'? Revenue (`Total__c`), number of orders, or something else?\n"
+                "Q: Show recent projects in sales → Please clarify what you mean by 'sales' — a department, a user group, or the industry vertical?\n"
+                "Q: Show data for Marketing → Which table and fields are you referring to? Please specify if this is user department, account industry, or project tag.\n"
+                "Q: Show top accounts by region → Please specify the region field to use (e.g., Country_Bill_to_Budget_owning_geo__c or Client_Geography_Tagging__c), and the metric for ranking accounts.\n"
+                "Q: Who is working on Pharma? → Please clarify what you mean by 'working on Pharma' — are you referring to a vertical in accounts, a Primary_Practice__c, or a project type?\n"
+                "Q: Give me the latest report → Could you clarify what 'latest report' refers to? Revenue, users, orders?\n"
+                "Q: How many employees in UI/UX? → Do you mean users with Title in the UI/UX practice, or projects under Primary_Practice__c = 'UI/UX'?\n"
+                "Q: Show something interesting → Can you clarify what you're looking for — trends, anomalies, or specific metrics?\n"
+                "Q: What is? → Can you please clarify your question?\n\n"
+                "Only respond with `clear` if the question is both unambiguous and aligned with the schema.\n"
+                "Return control to the supervisor after your response."
+            )
+        )
+
+        self.query_reframer_agent = create_react_agent(
+            model=self.model,
+            tools=[read_file_content],
+            name="user_query_reframer_agent",
+            prompt=(
+                "You are a User quetion reframer agent. Your job is to understand the user's natural language question and rephrase it in clear, unambiguous technical language suitable for SQL analysis. "
+                "Output only the reframed user's question as a single string. Once you have provided the reframed query, do not repeat or rephrase it. Return control to the supervisor."
+                "Use the documentation file 'db_schema_and_rules.md' as a source of truth for database schema, tables, columns, and business rules. "
+                "Example: What is the total revenue generated by the company in the last 3 months?"
+                "Reframed question: Select the sum of the amount column from the transactions table where the date is between last 3 months."
+            ),
+        )
+        
+        self.ba_agent = create_react_agent(
+            model=self.model,
+            tools=[read_file_content],
+            name="business_analysis_agent",
+            prompt=(
+                "You are a Business Analysis Agent. Given a reframed technical query, use the documentation file 'db_schema_and_rules.md' as a source of truth for database schema, tables, columns, and business rules. "
+                "Output your analysis in a concise format, listing only the relevant tables, columns, and business rules. Once you have provided this analysis, do not repeat or rephrase it. Return control to the supervisor."
+            ),
+        )
+
+        self.sql_generate_agent = create_react_agent(
+            model=self.model,
+            tools=[],
+            name="sql_generator_agent",
+            prompt=(
+                "You are a SQL Generation Agent. Given a clarified query and business analysis, generate a syntactically correct SQL query for a SQLite database. "
+                "Output the SQL query only once. Do not repeat or rephrase your answer. Return control to the supervisor when done. "
+                "IMPORTANT: All data in the database is stored in lowercase. When generating SQL queries, ALWAYS convert any string literals in WHERE clauses or comparisons to lowercase using the LOWER() function (e.g., WHERE LOWER(column) = 'value'), or ensure that string comparisons match the lowercase format of the data. This is required for correct results. "
+            ),
+        )
+
+        self.sql_evaluation_agent = create_react_agent(
+            model=self.model,
+            tools=[],
+            name="sql_evaluation_agent",
+            prompt=(
+                "You are a SQL Evaluation Agent. Your job is to evaluate the generated SQL query for correctness, performance optimization, and security checks. "
+                "Carefully review the SQL for syntax errors, possible logic mistakes, performance bottlenecks (such as missing WHERE clauses or unnecessary subqueries), and common security issues (such as SQL injection risks, unsafe user input, or data leaks). "
+                "Suggest improvements if needed, or confirm that the query is safe and optimal. Output your evaluation as a concise paragraph. Return control to the supervisor when done. "
+            ),
+        )
+
+        self.sql_runner_agent = create_react_agent(
+            model=self.model,
+            tools=[sqlite_tool],
+            name="sql_runner_agent",
+            prompt=(
+                "You are a SQL Runner Agent. Given a SQL query, execute it using the provided tool, and return the result. "
+            ),
+        )
+
+        self.chitchat_agent = create_react_agent(
+            model=self.model,
+            tools=[],
+            name="chit_chat_agent",
+            prompt=(
+                "You are a friendly and helpful assistant. Answer general chit-chat, small talk, and non-database questions conversationally and concisely. "
+                "If the user asks about the database or SQL, tell them to ask a specific database question. Do not answer SQL or database questions."
+            ),
+        )
+        
+        db_supervisor_prompt = (
+            "You are a database supervisor agent. Your job is to route user questions to the appropriate agents in the correct order. Follow these instructions strictly:\n"
+            "\n"
+            "For user questions regarding data in the database:\n"
+            "1. Route the question to the Clarity Check agent.\n"
+            "2. If the Clarity Check agent determines the question is ambiguous, incomplete, or could be interpreted in multiple ways:\n"
+            "    - Return only the clarifying question to the user in the 'answer' field.\n"
+            "    - Set 'is_clarification_needed' to true.\n"
+            "    - Leave all other fields ('sql_query', 'reframed_query', 'ba_analysis', 'suggested_questions') empty or None.\n"
+            "    - Do not proceed further until the user provides clarification.\n"
+            "3. If the question is clear, proceed to the following agents in order:\n"
+            "    a. Query Reframer agent  \n"
+            "    b. Business Analysis agent  \n"
+            "    c. SQL Generation agent  \n"
+            "    d. SQL Evaluation agent  \n"
+            "    e. SQL Runner agent  \n"
+            "4. After all steps, fill all relevant fields in the response.\n"
+            "\n"
+            "For general chit-chat or non-database questions:\n"
+            "- Route directly to the Chit Chat agent.\n"
+            "- When responding as Chit Chat agent:\n"
+            "    - Set 'is_chitchat' to true.\n"
+            "    - Only fill the 'answer' field.\n"
+            "    - Leave all other fields empty or None.\n"
+            "    - Do not add suggested questions in this case.\n"
+            "\n"
+            "Response Formatting:\n"
+            "- Only fill fields relevant to the current step and type of question.\n"
+            "- Never fill 'sql_query', 'reframed_query', 'ba_analysis', or 'suggested_questions' for chit-chat or clarification responses.\n"
+            "- Always provide a clear, concise answer in the 'answer' field.\n"
+        )
+
+        self.database_supervisor = create_supervisor(
+            agents=[
+                self.clarity_check_agent,
+                self.query_reframer_agent,
+                self.ba_agent,
+                self.sql_generate_agent,
+                self.sql_evaluation_agent,
+                self.sql_runner_agent,
+                self.chitchat_agent
+            ],
+            model=self.supervisor_model,
+            prompt=db_supervisor_prompt,
+            response_format=Response,
+            add_handoff_back_messages=True,
+            output_mode="full_history",
+        )
+        
+        self.database_app = self.database_supervisor.compile()
+
+
+    def ask_database(self, message: str):
+        config = RunnableConfig(configurable={"thread_id": "1"})
+        result = self.database_app.invoke({
+            "messages": [HumanMessage(content=message)]
+        }, config=config)
+
+        structured = result.get('structured_response', {})
+        if structured.get('clarifying_question'):
+            print(f"Clarification needed: {structured['clarifying_question']}")
+            return {'clarifying_question': structured['clarifying_question']}
+        print(structured)
+        # Return the structured response instead of just messages
+        return result.get("response", result["messages"])
+
+    def stream_database(self, message: str):
+        for chunk in self.database_app.stream({"messages": [HumanMessage(content=message)]}):
+            pretty_print_messages(chunk)
+
+    async def astream_database(self, message: str):
+        config = RunnableConfig(configurable={"thread_id": "1"})
+        async for chunk in self.database_app.astream({"messages": [HumanMessage(content=message)]}):
+            pretty_print_messages(chunk)
+            yield chunk
