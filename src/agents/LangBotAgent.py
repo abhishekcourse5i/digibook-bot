@@ -3,6 +3,8 @@ from langchain_core.messages import HumanMessage
 from src.llm.base_llm import get_llm
 from src.tools.sqlite_tool import sqlite_tool
 from src.tools.read_file_content import read_file_content
+from src.tools.azure_search_retriever import retrieve_sql_examples
+
 from langgraph_supervisor.supervisor import create_supervisor
 from pydantic import BaseModel, Field
 from langgraph.checkpoint.memory import InMemorySaver
@@ -54,13 +56,15 @@ def pretty_print_messages(update, last_message=False):
         print("\n")
 
 class Response(BaseModel):
-    answer: str = Field(description="The main answer to the user's question. For chit-chat or clarifications, this is the only field that should be filled.")
+    answer: str = Field(description="The final response of supervisor. For chit-chat or clarifications, this is the only field that should be filled.")
     sql_query: Optional[str] = Field(default=None, description="The SQL query generated, if applicable.")
     reframed_query: Optional[str] = Field(default=None, description="The reframed technical query, if applicable.")
     ba_analysis: Optional[str] = Field(default=None, description="Business analysis output, if applicable.")
     suggested_questions: Optional[list[str]] = Field(default=None, description="Suggested similar questions, if applicable.")
     is_chitchat: bool = Field(default=False, description="True if the question is chit-chat or non-database.")
-    is_clarification_needed: bool = Field(default=False, description="True if a clarifying question is needed; in this case, only 'answer' should be filled.")
+    # is_clarification_needed: bool = Field(default=False, description="True if a clarifying question is needed; in this case, only 'answer' should be filled.")
+    query_result: Optional[str] = Field(default=None, description="The formatted results of the SQL query execution.")
+
 
 class LangBotAgent:
     def __init__(self):
@@ -133,13 +137,19 @@ class LangBotAgent:
 
         self.sql_generate_agent = create_react_agent(
             model=self.model,
-            tools=[],
+            tools=[retrieve_sql_examples],
             name="sql_generator_agent",
             prompt=(
-                "You are a SQL Generation Agent. Given a clarified query and business analysis, generate a syntactically correct SQL query for a SQLite database. "
-                "Output the SQL query only once. Do not repeat or rephrase your answer. Return control to the supervisor when done. "
-                "IMPORTANT: All data in the database is stored in lowercase. When generating SQL queries, ALWAYS convert any string literals in WHERE clauses or comparisons to lowercase using the LOWER() function (e.g., WHERE LOWER(column) = 'value'), or ensure that string comparisons match the lowercase format of the data. This is required for correct results. "
-            ),
+                 "\n\nFOLLOW THIS PROCESS EXACTLY:\n"
+        "1. Use the retrieve_sql_examples tool with the reframed query to find similar examples\n"
+        "2. Study the returned examples\n"
+        "3. Generate ONE SQL query based on the examples and business analysis\n"
+        "6. Ensure your query is robust to different data formats by using LIKE, wildcard matching, or string transformations\n"
+        "7. Return ONLY the final SQL query\n"
+        "8. Return control to the supervisor\n\n"
+        "IMPORTANT: All data in the database is stored in lowercase, but be flexible with matching by using LIKE or pattern matching techniques.\n"
+        "DO NOT call retrieve_sql_examples more than once.\n"
+           ),
         )
 
         self.sql_evaluation_agent = create_react_agent(
@@ -150,6 +160,8 @@ class LangBotAgent:
                 "You are a SQL Evaluation Agent. Your job is to evaluate the generated SQL query for correctness, performance optimization, and security checks. "
                 "Carefully review the SQL for syntax errors, possible logic mistakes, performance bottlenecks (such as missing WHERE clauses or unnecessary subqueries), and common security issues (such as SQL injection risks, unsafe user input, or data leaks). "
                 "Suggest improvements if needed, or confirm that the query is safe and optimal. Output your evaluation as a concise paragraph. Return control to the supervisor when done. "
+                "IMPORTANT: All data in the database is stored in lowercase, but be flexible with matching by using LIKE or pattern matching techniques.\n"
+
             ),
         )
 
@@ -158,7 +170,15 @@ class LangBotAgent:
             tools=[sqlite_tool],
             name="sql_runner_agent",
             prompt=(
-                "You are a SQL Runner Agent. Given a SQL query, execute it using the provided tool, and return the result. "
+                 "You are a SQL Runner Agent. Given a SQL query, execute it using the provided tool, and return the result. "
+                "When returning query results:\n"
+                "1. Always format the results as a proper markdown table with headers and column alignment\n"
+                "2. Display the complete table - do not truncate rows or columns\n"
+                "3. Use headers that match the column names returned by the query\n"
+                "4. For all table results, use three-backtick markdown format with the table inside\n"
+                "5. Ensure your response includes the complete formatted table results\n"
+                "6. After showing the table, provide a brief 1-2 sentence explanation of what the query results show\n"
+
             ),
         )
 
@@ -176,19 +196,17 @@ class LangBotAgent:
             "You are a database supervisor agent. Your job is to route user questions to the appropriate agents in the correct order. Follow these instructions strictly:\n"
             "\n"
             "For user questions regarding data in the database:\n"
-            "1. Route the question to the Clarity Check agent.\n"
-            "2. If the Clarity Check agent determines the question is ambiguous, incomplete, or could be interpreted in multiple ways:\n"
-            "    - Return only the clarifying question to the user in the 'answer' field.\n"
-            "    - Set 'is_clarification_needed' to true.\n"
-            "    - Leave all other fields ('sql_query', 'reframed_query', 'ba_analysis', 'suggested_questions') empty or None.\n"
-            "    - Do not proceed further until the user provides clarification.\n"
-            "3. If the question is clear, proceed to the following agents in order:\n"
+            "1. Proceed directly with the following agents in order:\n"
             "    a. Query Reframer agent  \n"
             "    b. Business Analysis agent  \n"
             "    c. SQL Generation agent  \n"
             "    d. SQL Evaluation agent  \n"
             "    e. SQL Runner agent  \n"
-            "4. After all steps, fill all relevant fields in the response.\n"
+            "2. After all steps, fill all relevant fields in the response.\n"
+            "3. If the SQL query returns tabular results, ensure the complete table is displayed in a properly formatted markdown table.\n"
+            "4. For large tables, do not truncate the results - display all rows and columns completely.\n"
+            "5. Always include the formatted table results in the query_result field of the response.\n"
+
             "\n"
             "For general chit-chat or non-database questions:\n"
             "- Route directly to the Chit Chat agent.\n"
@@ -198,15 +216,17 @@ class LangBotAgent:
             "    - Leave all other fields empty or None.\n"
             "    - Do not add suggested questions in this case.\n"
             "\n"
-            "Response Formatting:\n"
-            "- Only fill fields relevant to the current step and type of question.\n"
-            "- Never fill 'sql_query', 'reframed_query', 'ba_analysis', or 'suggested_questions' for chit-chat or clarification responses.\n"
-            "- Always provide a clear, concise answer in the 'answer' field.\n"
+            "When presenting SQL query results:\n"
+            "1. Always format table output using markdown tables with proper column alignment\n"
+            "2. Include the full dataset without truncation\n"
+            "3. Use headers that match the column names returned by the query\n"
+            "4. For empty results, clearly state 'No data found' and suggest possible reasons\n"
+            "5. Always include the query results in the response's query_result field\n"
         )
 
         self.database_supervisor = create_supervisor(
             agents=[
-                self.clarity_check_agent,
+                # self.clarity_check_agent,
                 self.query_reframer_agent,
                 self.ba_agent,
                 self.sql_generate_agent,
@@ -218,32 +238,60 @@ class LangBotAgent:
             prompt=db_supervisor_prompt,
             response_format=Response,
             add_handoff_back_messages=True,
-            output_mode="full_history",
+            output_mode="last_message",
         )
         
         self.database_app = self.database_supervisor.compile()
 
+
+    # def ask_database(self, message: str):
+    #     config = RunnableConfig(configurable={"thread_id": "1"})
+    #     result = self.database_app.invoke({
+    #         "messages": [HumanMessage(content=message)]
+    #     }, config=config)
+        
+    #     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    #     print("result:", result)
+    #     structured = result.get('structured_response', {})
+    #     if structured.get('clarifying_question'):
+    #         print(f"Clarification needed: {structured['clarifying_question']}")
+    #         return {'clarifying_question': structured['clarifying_question']}
+    #     print(structured)
+    #     # Return the structured response instead of just messages
+    #     return result.get("response", result["messages"])
 
     def ask_database(self, message: str):
         config = RunnableConfig(configurable={"thread_id": "1"})
         result = self.database_app.invoke({
             "messages": [HumanMessage(content=message)]
         }, config=config)
-
-        structured = result.get('structured_response', {})
-        if structured.get('clarifying_question'):
-            print(f"Clarification needed: {structured['clarifying_question']}")
-            return {'clarifying_question': structured['clarifying_question']}
-        print(structured)
-        # Return the structured response instead of just messages
+        
+        print("result:", result)
+        
+        # Check if structured_response exists in the result
+        if "structured_response" in result:
+            structured = result["structured_response"]
+            
+            # If structured is a Response object (not a dict)
+            if isinstance(structured, Response):
+                # Just return the Response object directly
+                return structured
+        
+        # If structured is a dict
+        # elif isinstance(structured, dict) and "clarifying_question" in structured:
+        #     print(f"Clarification needed: {structured['clarifying_question']}")
+        #     return {'clarifying_question': structured['clarifying_question']}
+    
+    # Fallback to returning the messages
         return result.get("response", result["messages"])
 
     def stream_database(self, message: str):
         for chunk in self.database_app.stream({"messages": [HumanMessage(content=message)]}):
             pretty_print_messages(chunk)
 
+        #
     async def astream_database(self, message: str):
-        config = RunnableConfig(configurable={"thread_id": "1"})
+        # config = RunnableConfig(configurable={"thread_id": "1"})
         async for chunk in self.database_app.astream({"messages": [HumanMessage(content=message)]}):
             pretty_print_messages(chunk)
             yield chunk
