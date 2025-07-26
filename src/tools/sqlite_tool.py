@@ -12,6 +12,7 @@ def sqlite_tool(query: str) -> str:
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
+        print(f"Executing query: {query}")
         cursor.execute(query)
         # Fetch all results
         results = cursor.fetchall()

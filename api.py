@@ -1,16 +1,28 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, List
-import uvicorn
-import re
-from starlette.responses import StreamingResponse
 import json
-import asyncio
-from src.agents.LangBotAgent import LangBotAgent, Response
+import logging
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-# from src.tools.azure_search_index import initialize_search_index
+from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
+from botbuilder.schema import Activity, ActivityTypes
+
+from src.agents.LangBotAgent import LangBotAgent, Response
+
+from config.config import AZURE_BOT_APP_CONFIG
+
+APP_ID = AZURE_BOT_APP_CONFIG["azure_bot_app_id"]
+APP_PASSWORD = AZURE_BOT_APP_CONFIG["azure_app_bot_password"]
+
+adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
+adapter = BotFrameworkAdapter(adapter_settings)
+processed_activities = set()
+
+class InputPayload(BaseModel):
+    question: str = Field(..., description="Question to be asked")
 
 app = FastAPI(
     title="DigiBook Bot API",
@@ -99,86 +111,83 @@ async def ask_database_stream(request: QueryRequest):
     
     return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
+@app.post("/askbot",response_model=ApiResponse)
+async def ask_database(request: QueryRequest):
+    """
+    Process a natural language question and return database results
+    """
+    try:
+        result = agent.ask_database(request.query)
+        print(f"Result from agent: {result}")
+        
+        # If we got a Response object
+        if isinstance(result, Response):
+            # Extract table data if available in the messages
+            response_dict = result.model_dump()            
+            return response_dict        
+        # If we got a dictionary with structured_response
+        elif "structured_response" in result:
+            logging.info("Structured response received from agent.")
+            response_dict = result["structured_response"].model_dump()
+            return response_dict
+        else:
+            logging.info("Received non-structured response from agent.")
+            # If we just got messages or other content
+            return ApiResponse(answer=str(result))
+            
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/qa_teams")
+async def qna_teams(input_payload: Dict, request: Request) -> Any:
+    try:
+        str(vars(Activity()))
+        activity = Activity().deserialize(input_payload)
+        auth_header = request.headers.get("Authorization", "")
 
+        # Add idempotency check
+        activity_id = activity.id
+        if activity_id in processed_activities:
+            logging.info(
+                f"Skipping already processed activity ID: {activity_id}")
+            return {"message": "Activity already processed"}
 
-# @app.post("/ask",response_model=ApiResponse)
-# async def ask_database(request: QueryRequest):
-#     """
-#     Process a natural language question and return database results
-#     """
-#     try:
-#         result = agent.ask_database(request.query)
-        
-#         if isinstance(result, Response):
-#             # Extract table data if available in the messages
-#             response_dict = result.model_dump()
+        processed_activities.add(activity_id)
+        # Limit the size of the set to avoid memory issues
+        if len(processed_activities) > 1000:
+            processed_activities.pop()
+
+        async def process_activity_async(turn_context: TurnContext):
+            user_message = turn_context.activity.text
             
-#             # Make sure query_result is included in the response
-#             if result.query_result is None and hasattr(result, 'messages'):
-#                 # Try to extract table data from SQL runner agent's messages
-#                 for msg in result.messages:
-#                     if getattr(msg, 'name', '') == 'sql_runner_agent' and '```' in getattr(msg, 'content', ''):
-#                         import re
-#                         table_match = re.search(r'```(?:markdown)?\n(.*?)\n```', msg.content, re.DOTALL)
-#                         if table_match:
-#                             response_dict['query_result'] = table_match.group(1)
-#                             break
-            
-#             return response_dict
-            
-#         # If we got a dictionary with structured_response
-#         if isinstance(result, dict):
-#             if "structured_response" in result:
-#                 response_dict = result["structured_response"].model_dump()
-                
-#                 # Check for missing query_result
-#                 if "query_result" not in response_dict or response_dict["query_result"] is None:
-#                     # Try to extract from messages if available
-#                     if "messages" in result:
-#                         for msg in result["messages"]:
-#                             if getattr(msg, 'name', '') == 'sql_runner_agent' and '```' in getattr(msg, 'content', ''):
-#                                 import re
-#                                 table_match = re.search(r'```(?:markdown)?\n(.*?)\n```', msg.content, re.DOTALL)
-#                                 if table_match:
-#                                     response_dict['query_result'] = table_match.group(1)
-#                                     break
-                
-#                 return response_dict
-#             elif "clarifying_question" in result:
-#                 return ApiResponse(answer=result["clarifying_question"])
-        
-#         # If we just got messages or other content
-#         return ApiResponse(answer=str(result))
-        
-        
-        # Check if we got a Response object directly
-        # if isinstance(result, Response):
-        #     # Use model_dump() instead of dict() for Pydantic v2
-        #     return result.model_dump()
-            
-        # # If we got a dictionary with structured_response
-        # if isinstance(result, dict):
-        #     if "structured_response" in result:
-        #         return result["structured_response"].model_dump()
-        #     elif "clarifying_question" in result:
-        #         return ApiResponse(answer=result["clarifying_question"])
-        
-        # # If we just got messages or other content
-        # return ApiResponse(answer=str(result))
+            input_teams = {
+                "question": user_message
+            }
+
+            typing_activity = Activity(
+                type=ActivityTypes.typing,
+                relates_to=turn_context.activity.relates_to
+            )
+            await turn_context.send_activity(typing_activity)
+
+            output = await ask_database(InputPayload(**input_teams))
+
+            response = output["answer"]
+            final_answer = response
+
+            await turn_context.send_activity(final_answer)
     
-    # except Exception as e:
-    #     import traceback
-    #     traceback.print_exc()
-    #     raise HTTPException(status_code=500, detail=str(e))
+        await adapter.process_activity(activity, auth_header, process_activity_async)
+        logging.info("Sending Response to bot.")
+    except Exception as e:
+        logging.error(f"Error processing activity: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"message": "Response generated"}
 
 @app.get("/health")
 async def health_check():
     """Simple endpoint to check if API is running"""
     return {"status": "healthy"}
-
-
-if __name__ == "__main__":
-    print("Checking Azure Search index...")
-    # initialize_search_index("src/tools/updated_examples.csv")
-    uvicorn.run("api:app", host="127.0.0.1", port=8000, reload=True)
