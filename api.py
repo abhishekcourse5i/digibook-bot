@@ -22,7 +22,7 @@ adapter = BotFrameworkAdapter(adapter_settings)
 processed_activities = set()
 
 class InputPayload(BaseModel):
-    question: str = Field(..., description="Question to be asked")
+    query: str = Field(..., description="Question to be asked")
 
 app = FastAPI(
     title="DigiBook Bot API",
