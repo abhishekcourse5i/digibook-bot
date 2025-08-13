@@ -163,7 +163,7 @@ async def qna_teams(input_payload: Dict, request: Request) -> Any:
             user_message = turn_context.activity.text
             
             input_teams = {
-                "question": user_message
+                "query": user_message
             }
 
             typing_activity = Activity(
